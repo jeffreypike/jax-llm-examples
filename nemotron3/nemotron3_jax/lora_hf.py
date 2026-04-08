@@ -28,6 +28,15 @@ so import is `a = hf_A.T`, `b = hf_B.T`, and the layer index taken from the
 key picks which `LayerLoRA` slot to populate. Mamba `in_proj` is a single fused
 2D matrix in both representations, in `[wg, wx, wb, wc, wdt]` order, so no
 splitting is required at load time.
+
+Scaling: PEFT applies the LoRA delta as `(alpha / r) * (B @ A) @ x` at forward
+time. To avoid having every caller of `forward`/`prefill`/`decode_step`
+remember to pass `lora_scaling=lora_cfg.scaling` (and silently produce a 2x
+over-strong delta if they forget), this loader **pre-multiplies the `b` matrix
+by `alpha / r`**. The forward path can then run with the default
+`lora_scaling=1.0` and still match HF semantics exactly. The original `alpha`
+and `rank` are kept on the returned `LoRAConfig` so export code can reconstruct
+the on-disk format.
 """
 
 from __future__ import annotations
@@ -114,6 +123,7 @@ def load_hf_adapter(
         adapter_cfg = json.load(f)
     rank = int(adapter_cfg["r"])
     alpha = float(adapter_cfg["lora_alpha"])
+    scaling = alpha / rank
 
     tensors = _read_safetensors(st_path)
 
@@ -149,7 +159,9 @@ def load_hf_adapter(
             raise ValueError(
                 f"layer {idx} {proj}: rank mismatch — adapter_config r={rank} but A={hf_A.shape}, B={hf_B.shape}"
             )
-        pair = LoRAPair(a=hf_A.T, b=hf_B.T)
+        # Bake the PEFT scaling factor into `b` so the forward path can use the
+        # default `lora_scaling=1.0` without any caller-side bookkeeping.
+        pair = LoRAPair(a=hf_A.T, b=(hf_B * scaling).T)
         group, field = _PROJ_TO_FIELD[proj]
         layer = _ensure_group(layers[idx], group)
         setattr(getattr(layer, group), field, pair)
