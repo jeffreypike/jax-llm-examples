@@ -1063,6 +1063,10 @@ def mamba_block(
 
         hidden_states, B, C = conv_block(hidden_states, B, C, wx_conv, wb_conv, wc_conv, bx_conv, bb_conv, bc_conv)
 
+        hidden_states = jnp.where(mask[..., None, None], hidden_states, 0.0)
+        B = jnp.where(mask[..., None, None], B, 0.0)
+        C = jnp.where(mask[..., None, None], C, 0.0)
+
         if cache is not None and seq_len < kernel_size:
             hidden_states, B, C = jax.tree.map(lambda x: x[:, -seq_len:, ...], (hidden_states, B, C))
 
