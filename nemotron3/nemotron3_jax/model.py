@@ -1409,11 +1409,11 @@ def forward_layer(
     layer_lora=None,
     lora_scaling: float = 1.0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    x = x.astype(cfg.dtype)
+    layer_in = x.astype(cfg.dtype)
 
     # Attention block
     with jax.named_scope("attn_pre_norm"):
-        layer_in = rms_norm(x, layer.gamma, cfg.norm_eps)
+        layer_in = rms_norm(layer_in, layer.gamma, cfg.norm_eps)
     with jax.named_scope(f"ffn-{cfg.layer_pattern[idx]}"):
         if cfg.layer_pattern[idx] == "M":
             mamba_lora = layer_lora.mamba if layer_lora is not None else None
@@ -1433,7 +1433,7 @@ def forward_layer(
         else:
             raise NotImplementedError
     with jax.named_scope("residual"):
-        x = x + out.astype(cfg.dtype)
+        x = x + out.astype(x.dtype)
     return x, cache_updates
 
 
@@ -1443,6 +1443,7 @@ def forward(
 ):
     l2p = lambda *args: logical_to_physical(args, cfg.rules)
     x = weights.embedding.at[x, :].get(out_sharding=l2p("batch", "sequence", "act_embed"))  # Embed input tokens [B, T] -> [B, T D]
+    x = x.astype(jnp.float32)
 
     positions = segment_ids_to_positions(segment_ids)
     if is_type(cache, KVCache):
