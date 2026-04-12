@@ -830,9 +830,29 @@ def rms_norm(x: jax.Array, gamma: jax.Array | None, eps: jax.Array | float, axis
     gamma_fp32 = jnp.astype(gamma, jnp.float32) if gamma is not None else 1.0
     return jnp.astype((gamma_fp32 * x_fp32) / rms, x_dtype)
 
+
+def apply_rope(x: jax.Array, positions: jax.Array, head_dim: int, theta: float) -> jax.Array:
+    inv_freq = 1.0 / (theta ** (jnp.arange(0, head_dim, 2, dtype=jnp.float32) / head_dim))
+    freqs = jnp.einsum("bt,f->btf", positions.astype(jnp.float32), inv_freq)
+    emb = jnp.concatenate((freqs, freqs), axis=-1)
+    sin, cos = jnp.sin(emb), jnp.cos(emb)
+
+    def rotate_half(tensor):
+        x1, x2 = jnp.split(tensor, 2, axis=-1)
+        return jnp.concatenate((-x2, x1), axis=-1)
+
+    # broadcast to match x: [b, h, g, t, d] for q, or [b, h, t, d] for k
+    while sin.ndim < x.ndim:
+        sin = jnp.expand_dims(sin, axis=1)
+        cos = jnp.expand_dims(cos, axis=1)
+
+    return (x * cos.astype(x.dtype)) + (rotate_half(x) * sin.astype(x.dtype))
+
+
 def attention_block(
     x: jax.Array,
     segment_ids: jax.Array,
+    positions: jax.Array,
     layer: AttentionLayer,
     *,
     cache: KVCache | None = None,
@@ -868,6 +888,10 @@ def attention_block(
                 d_v = d_v.reshape((b, t, kv_heads, head_dim)).transpose((0, 2, 1, 3))
                 d_v = reshard(d_v, jax.typeof(v).sharding.spec)
                 v = v + d_v
+
+    with jax.named_scope("apply_rope"):
+        q = apply_rope(q, positions, cfg.head_dim, cfg.rope_theta)
+        k = apply_rope(k, positions, cfg.head_dim, cfg.rope_theta)
 
     with jax.named_scope("cache_update"):
         if is_type(cache, KVCache):
@@ -1402,6 +1426,7 @@ def mlp_block(
 def forward_layer(
     x: jax.Array,
     segment_ids: jax.Array,
+    positions: jax.Array,
     layer: Layer,
     idx: int,
     cfg: Config,
@@ -1427,7 +1452,7 @@ def forward_layer(
         elif cfg.layer_pattern[idx] == "*":
             attn_lora = layer_lora.attn if layer_lora is not None else None
             out, cache_updates = attention_block(
-                layer_in, segment_ids, layer.ffw, cache=cache, idx=idx, cfg=cfg,
+                layer_in, segment_ids, positions, layer.ffw, cache=cache, idx=idx, cfg=cfg,
                 lora=attn_lora, lora_scaling=lora_scaling,
             )
         else:
@@ -1453,7 +1478,7 @@ def forward(
     for idx, layer in enumerate(weights.layers):
         layer_lora = lora.layers[idx] if lora is not None else None
         x, cache_updates = forward_layer(
-            x, segment_ids, layer, idx, cfg, cache,
+            x, segment_ids, positions, layer, idx, cfg, cache,
             layer_lora=layer_lora, lora_scaling=lora_scaling,
         )
         all_cache_updates.append(cache_updates)
