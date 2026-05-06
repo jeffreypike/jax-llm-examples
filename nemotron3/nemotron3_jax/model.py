@@ -1233,7 +1233,18 @@ def _moe_gmm(lhs, rhs, group_sizes, topk_idx, cfg: Config):
     return ret.astype(cfg.dtype)
 
 
-def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scaling: float = 1.0):
+def moe_block(x: jax.Array, layer: MoELayer, cfg: Config,
+              lora_shared=None, lora_experts=None, lora_scaling: float = 1.0):
+    """Forward through one MoE layer.
+
+    `lora_shared`: an `MoESharedLoRA`-shaped object (with `.ws_up`, `.ws_down`),
+    threaded through `mlp_block` for the shared-expert path.
+    `lora_experts`: an `MoEExpertLoRA`-shaped object (with `.we_up`, `.we_down`),
+    applied per-routed-expert inside the routed-expert `shard_map` via two
+    `ragged_dot`s mirroring the base GMM. See `nemotron3_jax/lora.py` for the
+    sharding contract that makes this require only one extra `psum` (on the
+    rank-sized intermediate) and no extra all-gather.
+    """
     assert x.ndim == 3
     l2p = lambda *axes: logical_to_physical(axes, cfg.rules)
     _psc = lambda z, spec: reshard(z, P(*spec))
@@ -1257,7 +1268,23 @@ def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scalin
     we_up = psc(layer.we_up, we_up_spec)
     we_down = psc(layer.we_down, we_down_spec)
 
-    in_specs = (x_spec, we_up_spec, we_down_spec, topk_weights_spec, topk_idx_spec)
+    # Per-expert LoRA (optional). Shardings are chosen to match the base weights'
+    # contraction axes so the in-kernel ragged_dots compose without extra collectives,
+    # except for one psum on the rank-sized intermediate of the we_down LoRA path.
+    HAS_LORA_E = lora_experts is not None
+    if HAS_LORA_E:
+        l_up_a_spec   = l2p("moe_e_ep", None,        None)        # (E, embed,    rank)
+        l_up_b_spec   = l2p("moe_e_ep", None,        "moe_e_tp")  # (E, rank,     ffw)
+        l_down_a_spec = l2p("moe_e_ep", "moe_e_tp",  None)        # (E, ffw,      rank)
+        l_down_b_spec = l2p("moe_e_ep", None,        None)        # (E, rank,     embed)
+        l_up_a   = psc(lora_experts.we_up.a,   l_up_a_spec)
+        l_up_b   = psc(lora_experts.we_up.b,   l_up_b_spec)
+        l_down_a = psc(lora_experts.we_down.a, l_down_a_spec)
+        l_down_b = psc(lora_experts.we_down.b, l_down_b_spec)
+        in_specs = (x_spec, we_up_spec, we_down_spec, topk_weights_spec, topk_idx_spec,
+                    l_up_a_spec, l_up_b_spec, l_down_a_spec, l_down_b_spec)
+    else:
+        in_specs = (x_spec, we_up_spec, we_down_spec, topk_weights_spec, topk_idx_spec)
 
     is_embedding_sharded = l2p("act_embed")[0] is not None
     if is_embedding_sharded:  # activations are sharded
@@ -1271,7 +1298,11 @@ def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scalin
     expert_size = cfg.moe_num_experts // expert_count
 
     @partial(jax.shard_map, mesh=cfg.mesh, in_specs=in_specs, out_specs=out_spec, check_vma=False)
-    def _expert_fn(x, we_up, we_down, topk_weights, topk_idx):
+    def _expert_fn(*args):
+        if HAS_LORA_E:
+            x, we_up, we_down, topk_weights, topk_idx, l_up_a, l_up_b, l_down_a, l_down_b = args
+        else:
+            x, we_up, we_down, topk_weights, topk_idx = args
         (b, s, d), e = x.shape, cfg.moe_experts_per_tok
         expert_idx = jax.lax.axis_index(expert_axname) if expert_axname is not None else 0
         tensor_idx = jax.lax.axis_index(tensor_axname) if tensor_axname is not None else 0
@@ -1308,10 +1339,42 @@ def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scalin
 
         with jax.named_scope("we_up"):
             ff_up = _moe_gmm(x_repeat_sort_, we_up, group_sizes_shard, expert_mapped_topk_idx_sort_, cfg)
+            if HAS_LORA_E:
+                with jax.named_scope("lora_we_up"):
+                    # x_repeat_sort_ has full embed (replicated across tp); l_up_a is also
+                    # full on embed/rank and sharded only on experts -> intermediate is full
+                    # rank, no collective needed. l_up_b is sharded on the tp-ffw axis, so
+                    # the second ragged_dot's output naturally lands in the same
+                    # [tokens, ffw_size_shard] layout as the base ff_up.
+                    lup_int = _moe_gmm(x_repeat_sort_, l_up_a, group_sizes_shard,
+                                       expert_mapped_topk_idx_sort_, cfg)
+                    lup_delta = _moe_gmm(lup_int, l_up_b, group_sizes_shard,
+                                         expert_mapped_topk_idx_sort_, cfg)
+                    ff_up = ff_up + lup_delta
             ff_up = jnp.where(valid_group_mask_sort_[..., None], ff_up, 0)
             ff_up = jax.nn.relu(ff_up) ** 2
         with jax.named_scope("we_down"):
             ff_out = _moe_gmm(ff_up, we_down, group_sizes_shard, expert_mapped_topk_idx_sort_, cfg)
+            if HAS_LORA_E:
+                with jax.named_scope("lora_we_down"):
+                    # ff_up is sharded on the tp-ffw axis, and l_down_a's "in" axis matches.
+                    # The first ragged_dot is therefore partial-summed over tp on the rank
+                    # dim; we psum to recover the full intermediate. l_down_b is replicated
+                    # on the embed axis, so the second ragged_dot produces a full
+                    # [tokens, embed] delta that is identical on every tp shard.
+                    ldown_int = _moe_gmm(ff_up, l_down_a, group_sizes_shard,
+                                         expert_mapped_topk_idx_sort_, cfg)
+                    if tensor_axname is not None and tensor_count > 1:
+                        ldown_int = jax.lax.psum(ldown_int, tensor_axname)
+                    ldown_delta = _moe_gmm(ldown_int, l_down_b, group_sizes_shard,
+                                           expert_mapped_topk_idx_sort_, cfg)
+                    # The base path's ff_out is partial-summed across tp on the embed axis,
+                    # and the existing experts_collective psums it across tp afterwards. To
+                    # have that same psum yield (ff_out_full + ldown_delta_full), each tp
+                    # shard contributes ldown_delta / tensor_count.
+                    if tensor_count > 1:
+                        ldown_delta = ldown_delta / float(tensor_count)
+                    ff_out = ff_out + ldown_delta
             ff_out = jnp.where(valid_group_mask_sort_[..., None], ff_out, 0)  # expensive
 
         if cfg.ep_strategy == "prefill":
@@ -1364,12 +1427,20 @@ def moe_block(x: jax.Array, layer: MoELayer, cfg: Config, lora=None, lora_scalin
 
     with jax.named_scope("moe_routed_expert"):
         x_ = psc(x, x_spec)
-        ff_out_expert = _expert_fn(x_, we_up, we_down, topk_weights, topk_idx)[..., : x.shape[-1]]
+        if HAS_LORA_E:
+            ff_out_expert = _expert_fn(
+                x_, we_up, we_down, topk_weights, topk_idx,
+                l_up_a, l_up_b, l_down_a, l_down_b,
+            )[..., : x.shape[-1]]
+        else:
+            ff_out_expert = _expert_fn(
+                x_, we_up, we_down, topk_weights, topk_idx,
+            )[..., : x.shape[-1]]
         ff_out_expert = psc(ff_out_expert, l2p("batch", "sequence", "act_embed"))
     with jax.named_scope("moe_shared_expert"):
         x_ = psc(x, x_spec)
-        lora_up = lora.ws_up if lora is not None else None
-        lora_down = lora.ws_down if lora is not None else None
+        lora_up = lora_shared.ws_up if lora_shared is not None else None
+        lora_down = lora_shared.ws_down if lora_shared is not None else None
         ff_out_shared = mlp_block(
             x_, layer.ws_up, layer.ws_down, cfg=cfg,
             lora_up=lora_up, lora_down=lora_down, lora_scaling=lora_scaling,
@@ -1422,8 +1493,13 @@ def forward_layer(
                 lora=mamba_lora, lora_scaling=lora_scaling,
             )
         elif cfg.layer_pattern[idx] == "E":
-            moe_lora = layer_lora.moe_shared if layer_lora is not None else None
-            out, cache_updates = moe_block(layer_in, layer.ffw, cfg=cfg, lora=moe_lora, lora_scaling=lora_scaling), None
+            moe_lora_shared = layer_lora.moe_shared if layer_lora is not None else None
+            moe_lora_experts = layer_lora.moe_experts if layer_lora is not None else None
+            out, cache_updates = moe_block(
+                layer_in, layer.ffw, cfg=cfg,
+                lora_shared=moe_lora_shared, lora_experts=moe_lora_experts,
+                lora_scaling=lora_scaling,
+            ), None
         elif cfg.layer_pattern[idx] == "*":
             attn_lora = layer_lora.attn if layer_lora is not None else None
             out, cache_updates = attention_block(

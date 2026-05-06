@@ -29,6 +29,9 @@ Targets supported (matching the user's HF PEFT spec):
 - Mamba `in_proj` (fused across the [wg, wx, wb, wc, wdt] split) and
   `out_proj` for selected layers.
 - MoE `shared_experts.up_proj`, `shared_experts.down_proj` for all MoE layers.
+- MoE per-routed-expert `experts.{i}.up_proj`, `experts.{i}.down_proj` for all
+  MoE layers, stored stacked across the expert axis as a single tensor pair so
+  the forward path can use `ragged_dot` against it inside the MoE shard_map.
 """
 
 from __future__ import annotations
@@ -74,6 +77,7 @@ class LoRAConfig:
     target_attn_layers: tuple[int, ...] = DEFAULT_ATTN_LAYERS
     target_mamba_layers: tuple[int, ...] = DEFAULT_MAMBA_LAYERS
     target_moe_shared: bool = True
+    target_moe_experts: bool = False
     dtype: jax.typing.DTypeLike = jnp.bfloat16
 
     @property
@@ -88,6 +92,9 @@ class LoRAConfig:
 
     def adapt_moe_shared(self, layer_idx: int, cfg: Config) -> bool:
         return cfg.layer_pattern[layer_idx] == "E" and self.target_moe_shared
+
+    def adapt_moe_experts(self, layer_idx: int, cfg: Config) -> bool:
+        return cfg.layer_pattern[layer_idx] == "E" and self.target_moe_experts
 
 
 # ----------------------------------------------------------------------------
@@ -182,12 +189,67 @@ class MoESharedLoRA:
         )
 
 
+def _make_stacked_lora_pair_info(
+    num_experts: int, in_dim: int, out_dim: int, rank: int, dtype,
+    a_logical: tuple, b_logical: tuple,
+) -> "LoRAPair":
+    """Build a LoRAPair of stacked-across-experts ArrayInfos.
+
+    Shapes: a is (num_experts, in_dim, rank); b is (num_experts, rank, out_dim).
+    Logical axes for a/b are caller-supplied so the per-expert sharding can match
+    whichever base weight (we_up vs we_down) this LoRA pair targets.
+    """
+    return LoRAPair(
+        a=ArrayInfo((num_experts, in_dim, rank), dtype, a_logical, _lora_a_init(in_dim)),
+        b=ArrayInfo((num_experts, rank, out_dim), dtype, b_logical, _zeros_init),
+    )
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass
+class MoEExpertLoRA:
+    """Per-routed-expert LoRA, stacked across the expert axis.
+
+    `we_up.a`:   (E, embed,    rank)        sharded ("moe_e_experts", "moe_e_up_embed", None)
+    `we_up.b`:   (E, rank,     ffw_size)    sharded ("moe_e_experts", None, "moe_e_up_ffw")
+    `we_down.a`: (E, ffw_size, rank)        sharded ("moe_e_experts", "moe_e_down_ffw", None)
+    `we_down.b`: (E, rank,     embed)       sharded ("moe_e_experts", None, "moe_e_down_embed")
+
+    The sharding for each tensor matches the corresponding axis of the base
+    `we_up`/`we_down` so that, inside the `_expert_fn` shard_map, every
+    `ragged_dot` involving the LoRA pair has consistent layouts with the base
+    GMM and no extra all-gathers are required. The `rank` axis is replicated
+    everywhere (it's small, and replicating avoids communication on it).
+    """
+    we_up: LoRAPair
+    we_down: LoRAPair
+
+    @classmethod
+    def abstract(cls, cfg: Config, lora_cfg: LoRAConfig) -> "MoEExpertLoRA":
+        r = lora_cfg.rank
+        d = lora_cfg.dtype
+        E = cfg.moe_num_experts
+        return MoEExpertLoRA(
+            we_up=_make_stacked_lora_pair_info(
+                E, cfg.embed, cfg.moe_ffw_size, r, d,
+                a_logical=("moe_e_experts", "moe_e_up_embed", None),
+                b_logical=("moe_e_experts", None, "moe_e_up_ffw"),
+            ),
+            we_down=_make_stacked_lora_pair_info(
+                E, cfg.moe_ffw_size, cfg.embed, r, d,
+                a_logical=("moe_e_experts", "moe_e_down_ffw", None),
+                b_logical=("moe_e_experts", None, "moe_e_down_embed"),
+            ),
+        )
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass
 class LayerLoRA:
     attn: AttnLoRA | None
     mamba: MambaLoRA | None
     moe_shared: MoESharedLoRA | None
+    moe_experts: MoEExpertLoRA | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -201,8 +263,9 @@ class LoRAWeights(_Init):
         for i in range(cfg.num_layers):
             attn = AttnLoRA.abstract(cfg, lora_cfg) if lora_cfg.adapt_attn(i, cfg) else None
             mamba = MambaLoRA.abstract(cfg, lora_cfg) if lora_cfg.adapt_mamba(i, cfg) else None
-            moe = MoESharedLoRA.abstract(cfg, lora_cfg) if lora_cfg.adapt_moe_shared(i, cfg) else None
-            layers.append(LayerLoRA(attn=attn, mamba=mamba, moe_shared=moe))
+            moe_s = MoESharedLoRA.abstract(cfg, lora_cfg) if lora_cfg.adapt_moe_shared(i, cfg) else None
+            moe_e = MoEExpertLoRA.abstract(cfg, lora_cfg) if lora_cfg.adapt_moe_experts(i, cfg) else None
+            layers.append(LayerLoRA(attn=attn, mamba=mamba, moe_shared=moe_s, moe_experts=moe_e))
         return LoRAWeights(layers=layers)
 
     @classmethod
